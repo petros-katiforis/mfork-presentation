@@ -35,6 +35,8 @@
   - *Lightweightness*: Context switches are instantaneous, TLB flushing
     is practically eliminated. #pause IPC is _fast_ (no kernel copy). #pause
 
+  - 64-bit virtual address space is massive #pause
+
   - *#text(fill: red)[Key Obstacle]*: _Inherently_ incompatible with
     `fork`. #pause
 
@@ -51,7 +53,8 @@ GitHub and around half of the 50 most popular Debian packages use
 - `fork` for sub-process execution (bash) #pause
 - `fork` for concurrency (nginx, apache) #pause
 - `fork` for privilege separation (OpenSSH, qmail) #pause
-- `fork` for on-demand resource duplication (redis snapshots)
+- `fork` for on-demand resource duplication (Redis, lazy
+  store on disk)
 
 == Implementation Challenges
 
@@ -73,11 +76,40 @@ GitHub and around half of the 50 most popular Debian packages use
 - Segment-Relative Addressing: Fast but gets messy when handwritten
   assembly, JIT runtimes and compiler integration are taken into
   account. (considerable engineering effort across the entire
-  development toolchain) #pause
+  development toolchain) #pause (Angel, 1992) #pause
 
 - OS as a Process: Treat SASOS as a process and implement `fork` for
   the hypervisor. Circumvents most challenges. Clever, _slow_ in
   practice (misses the entire point).
+
+---
+
+#[
+  #set text(size: 15pt)
+
+  #figure(
+    table(
+      columns: (auto, auto, auto, auto, auto, auto, auto),
+      inset: 6pt,
+      align: (center),
+      stroke: 0.5pt,
+
+      [*System*], [*SAS*], [*Isolation*], [*SC*], [*IPCs*], [*Seg*], [*f+e only*],
+      
+      [Angel], [*Yes*], [*Yes*], [*Yes*], [*Fast*], [Yes], [No],
+      [Mungi], [*Yes*], [*Yes*], [*Yes*], [*Fast*], [Yes], [No],
+      [Nephele], [No], [*Yes*], [No], [Med], [*No*], [*No*],
+      [KylinX], [No], [*Yes*], [No], [Med], [*No*], [*No*],
+      [Graphene], [No], [*Yes*], [No], [Med], [*No*], [*No*],
+      [Graphene SGX], [No], [*Yes*], [No], [Slow], [*No*], [*No*],
+      [Iso-Unik], [No], [*Yes*], [*Yes*], [Med], [*No*], [*No*],
+      [OSv], [*Yes*], [No], [*Yes*], [*Fast*], [*No*], [Yes],
+      [Junction], [*Yes*], [No], [No], [Med], [*No*], [Yes],
+      
+      [*$mu$Fork*], [*Yes*], [*Yes*], [*Yes*], [*Fast*], [*No*], [*No*],
+    )
+  )
+]
 
 == Overview of μFork
 
@@ -110,8 +142,9 @@ memory safety bugs in RISC processors. #pause
 
 ```asm
 lw s0, 8(a1)
-# CHERI Version: Registers are extended
-clw	s0, 8(ca1)
+# CHERI (extended registers, explicit pointer arithmetic)
+clw	s0, 0(ca1)
+lc cs3, 8(ca1)
 ```
 
 #empty-slide[
@@ -123,7 +156,6 @@ CHERI capabilities respect _monotonicity_. #pause The hardware
 provides an almighty capability which is stripped down by the kernel
 at will. #pause Isolation is guaranteed by the simple fact that
 capability transformations can only ever _reduce_ privileges. #pause
-Relative references? Not a problem. #pause
 
 - Principle of Least Privilege
 - Principle of Intentional Use
@@ -137,12 +169,13 @@ system call entry point references (tokens) that can be called
 relentlessly. #pause Crucially, these capabilities _cannot_ be
 modified by anyone except the sealer. #pause
 
-$->$ The SASOS is, once more, blazingly (🤢) fast.
+$->$ Blazingly fast
 
 == Process-Kernel Isolation (Cont.)
 
 #note[
-  We implicitly refer to the Unikraft implementation.
+  We implicitly refer to the Unikraft implementation. μFork is simply
+  a *layer*.
 ]
 
 #pause Privileged instructions are safely prohibited
@@ -155,11 +188,14 @@ procedures.
 - *ASLR*? #pause Randomize the base offset of the contiguous process
   segment #pause
 
-- *Heap*? #pause VAS is massive, assume a safe upper-bound. #pause
+- *Heap*? #pause VAS is massive, assume a safe upper-bound #pause
 
-- *SMP*? #pause Big kernel lock (WIP :P). #pause
+- *SMP*? #pause Serializing kernel code execution with a "big kernel
+  lock" (they're working on it). #pause
 
 - *Fragmentation*? #pause Ignore (consider compaction)
+
+- *TOCTTOU*? _Optional_ system call parameter duplication
 
 == Clarifying CoPA
 
@@ -184,7 +220,8 @@ Exploit the CHERI page-table capability-was-accessed bit. #pause
   place.
 
 // GOT must be proactively copied because the address space is no
-// longer identical.
+// longer identical (one physical page for library, separate virtual
+// pages).
 
 == Overview
 
@@ -201,7 +238,137 @@ Comparison with Nephele is unnecessary, it _will_ be slower. Nephele
 is designed for `x86_64` only, so experimental data is directly
 extracted from their (possibly biased) paper. They still lose.
 
-#empty-slide[
-  #set align(center)
-  #image("bench_two.svg", width: 90%)
+== Evaluation (Shorthand)
+
+- $mu$Fork + Unikraft running on top of the `bhyve` supervisor
+- CheriBSD (FreeBSD) running on bare-metal
+- `x86_64` Nephele (vitalization-based SASOS `fork` implementation)
+
+// Creating a typst macro for the upcoming evaluation slides
+// They'll animate note blocks on top of graphs
+#let overlay-metric-slide(image-path, ..cards) = slide[
+  #box(width: 100%, height: 80%)[
+    #set align(center + horizon)
+    #set text(size: 15pt)
+    #image(image-path, width: 70%)
+
+    // Placing a semi-transparent veil on top of the original image
+    // Not sure how to programmatically modify transparency otherwise
+    #uncover("2-")[
+      #place(top + left)[
+        #block(width: 100%, height: 100%, fill: rgb("ffffffaa")) 
+      ]
+    ]
+
+    #for (i, card) in cards.pos().enumerate() [
+      #let step = i + 2 
+      
+      #let is-hl = card.at("highlight", default: false)
+      #let bg-color = if is-hl { rgb("e6f2ffee") } else { rgb("fffffffe") }
+      #let stroke-color = if is-hl { blue } else { gray.lighten(50%) }
+      #let padding = if is-hl { 1.2em } else { 1em }
+      
+      // Can be overwritten by user
+      #let pos = card.at("position", default: top + left)
+      #let offset = card.at("spacing", default: 0em)
+
+      #uncover(str(step) + "-")[
+        #place(pos, dy: offset)[
+          #block(fill: bg-color, inset: padding, radius: 0.5em, stroke: stroke-color)[
+	    #card.content
+          ]
+        ]
+      ]
+    ]
+  ]
+]
+
+== 1. Forking `hello_world.c`
+
+#overlay-metric-slide(
+  "hello_world.svg",
+  
+  (
+    position: top + left,
+    spacing: 0em,
+    content: [
+      *Nephele:* 10,700 μs \
+      _Creating a Xen domain is complicated_
+    ]
+  ),
+
+  (
+    position: top + left,
+    spacing: 3em,
+    content: [
+      *CheriBSD:* 197 μs
+    ]
+  ),
+
+  (
+    highlight: true,
+    position: top + right,
+    spacing: 0em,
+    content: [
+      *μFork:* *54 µs* \
+      _Bypasses page table switches altogether!_
+    ]
+  ),
+)
+
+== 2. Does it Actually Matter? (FaaS)
+
+#overlay-metric-slide(
+  "faas.svg",
+  
+  (
+    position: top + left,
+    spacing: -1em,
+    content: [
+      FaaS functions are typically short-lived, with 50% \
+      of functions taking less than 1s to execute. \
+      (Zygote language runtime pre-warming technique)
+    ]
+  ),
+
+  (
+    highlight: true,
+    position: top + right,
+    spacing: -1em,
+    content: [
+      $mu$Fork handles *24% more requests per second* \
+      than CheriBSD across multiple cores \
+      (TOCTTOU? `float_operation` *not* system-call intensive)
+    ]
+  ),
+)
+
+== 3. Evaluating CoPA Performance
+
+#overlay-metric-slide(
+  "copa.svg",
+  
+  (
+    position: top + left,
+    spacing: 0em,
+    content: [
+      Fork latency and memory consumption are *analogous*. \
+      The blue line is a full synchronous copy. \
+      The usual bottleneck is the heap itself (static).
+    ]
+  ),
+
+  (
+    highlight: true,
+    position: top + left,
+    spacing: 5.5em,
+    content: [
+      CoPA is *incredibly* performant. \
+      $mu$Fork naturally outperforms traditional OSes.
+    ]
+  ),
+)
+
+#focus-slide[
+  Questions?
 ]
